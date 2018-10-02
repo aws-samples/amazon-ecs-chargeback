@@ -1,0 +1,290 @@
+#!/usr/bin/env python
+
+# Copyright 2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
+# A copy of the License is located at
+#
+#     http://aws.amazon.com/apache2.0/
+#
+# or in the "license" file accompanying this file.
+# This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and limitations under the License.
+
+import boto3
+from boto3.dynamodb.conditions import Key, Attr
+import ast
+from argparse import ArgumentParser
+import datetime
+import re
+import sys
+import logging
+import json
+
+cpu2mem_weight = 0.5
+pricing_dict = {}
+region_table = {}
+
+def get(table, region, cluster, service):
+    """
+    Scan the DynamoDB table to get all tasks in a service.
+    Input - region, ECS ClusterARN and ECS ServiceName
+    """
+    resp = table.scan(
+        FilterExpression=Attr('group').eq('service') &
+                Attr('groupName').eq(service) &
+                Attr('region').eq(region) &
+                Attr('clusterArn').eq(cluster)
+    )
+    return(resp)
+
+def ecs_getClusterArn(region, cluster):
+    """ Given the ECS cluster name and the region, get the ECS ClusterARN. """
+    client=boto3.client('ecs', region_name=region)
+    response = client.describe_clusters(clusters=[cluster])
+
+    logging.debug("ECS Cluster Details: %s", response)
+    if len(response['clusters']) == 1:
+        return (response['clusters'][0]['clusterArn'])
+    else:
+        return ''
+
+def ec2_pricing(region, instance_type, tenancy, ostype):
+    """
+    Query AWS Pricing APIs to find cost of EC2 instance in the region.
+    Given the paramters we use at input, we should get a UNIQUE result.
+    TODO: In the current version, we only consider OnDemand price. If
+    we start considering actual cost, we need to consider input from 
+    CUR on an hourly basis.
+    """
+    svc_code = 'AmazonEC2'
+    client = boto3.client('pricing', region_name="us-east-1")
+    response = client.get_products(ServiceCode=svc_code,
+        Filters = [
+            {'Type' :'TERM_MATCH', 'Field':'location',          'Value':region},
+            {'Type' :'TERM_MATCH', 'Field': 'servicecode',      'Value': svc_code},
+            {'Type' :'TERM_MATCH', 'Field': 'preInstalledSw',   'Value': 'NA'},
+            {'Type' :'TERM_MATCH', 'Field': 'tenancy',          'Value': tenancy},
+            {'Type' :'TERM_MATCH', 'Field':'instanceType',      'Value':instance_type},
+            {'Type' :'TERM_MATCH', 'Field': 'operatingSystem',  'Value': ostype}
+        ],
+        MaxResults=100
+    )
+
+    ret_list = []
+    if 'PriceList' in response:
+        for iter in response['PriceList']:
+            ret_dict = {}
+            mydict = ast.literal_eval(iter)
+            ret_dict['memory'] = mydict['product']['attributes']['memory']
+            ret_dict['vcpu'] = mydict['product']['attributes']['vcpu']
+            ret_dict['instanceType'] = mydict['product']['attributes']['instanceType']
+            ret_dict['operatingSystem'] = mydict['product']['attributes']['operatingSystem']
+            ret_dict['normalizationSizeFactor'] = mydict['product']['attributes']['normalizationSizeFactor']
+            mydict_terms = mydict['terms']['OnDemand'][mydict['terms']['OnDemand'].keys()[0]]
+            ret_dict['unit'] = mydict_terms['priceDimensions'][mydict_terms['priceDimensions'].keys()[0]]['unit']
+            ret_dict['pricePerUnit'] = mydict_terms['priceDimensions'][mydict_terms['priceDimensions'].keys()[0]]['pricePerUnit']
+            ret_list.append(ret_dict)
+    
+    ec2_cpu  = float( ret_list[0]['vcpu'] )
+    ec2_mem  = float( re.findall("[+-]?\d+\.?\d*", ret_list[0]['memory'])[0] )
+    ec2_cost = float( ret_list[0]['pricePerUnit']['USD'] )
+    return(ec2_cpu, ec2_mem, ec2_cost)
+
+def ecs_pricing(region):
+    """
+    Get Fargate Pricing in the region.
+    """
+    svc_code = 'AmazonECS'
+    client = boto3.client('pricing', region_name="us-east-1")
+    response = client.get_products(ServiceCode=svc_code, 
+        Filters = [
+            {'Type' :'TERM_MATCH', 'Field':'location',          'Value':region},
+            {'Type' :'TERM_MATCH', 'Field': 'servicecode',      'Value': svc_code},
+        ],
+        MaxResults=100
+    )
+
+    cpu_cost = 0.0
+    mem_cost = 0.0
+
+    if 'PriceList' in response:
+        for iter in response['PriceList']:
+            mydict = ast.literal_eval(iter)
+            mydict_terms = mydict['terms']['OnDemand'][mydict['terms']['OnDemand'].keys()[0]]
+            mydict_price_dim = mydict_terms['priceDimensions'][mydict_terms['priceDimensions'].keys()[0]]
+            if mydict_price_dim['description'].find('CPU') > -1:
+                cpu_cost = mydict_price_dim['pricePerUnit']['USD']
+            if mydict_price_dim['description'].find('Memory') > -1:
+                mem_cost = mydict_price_dim['pricePerUnit']['USD']
+
+    return(cpu_cost, mem_cost)
+
+def duration(startedAt, stoppedAt, start_m_epoch, stop_m_epoch, runTime, now):
+    """
+    Get the duration for which the task's cost needs to be calculated.
+    This will vary depending on the CLI's input parameter (task lifetime,
+    particular month, last N days etc.) and how long the task has run.
+    TODO: Currently, we are only considering the task lifetime. The CLI
+    input parameter needs to be worked on.
+    """
+
+    mRunTime = 0.0
+
+    start_e = datetime.datetime.strptime(startedAt, '%Y-%m-%dT%H:%M:%S.%fZ')
+    if (stoppedAt == 'STILL-RUNNING'):
+        stopped_e = now
+        mRunTime = round ( (stopped_e-start_e).total_seconds() )
+    else:
+        #stopped_e = datetime.datetime.strptime(stoppedAt, '%Y-%m-%dT%H:%M:%S.%fZ')
+        mRunTime = runTime
+
+    return(mRunTime)
+
+    if runTime == 0.0:
+        # Task is still running.
+        # EndTime should be:
+        #   Now - if I am measuring last N days, last N hours, or complete lifetime.
+        #   Last Day of Month - if I am finding cost for a particular month.
+        # 
+        endTime = stop_m_epoch
+
+def ec2_cpu2mem_weights(mem, cpu):
+    # Depending on the type of instance, we can make split cost beteen CPU and memory
+    # disproportionately.
+    global cpu2mem_weight
+    return (cpu2mem_weight)
+
+def cost_of_ec2task(region, cpu, memory, ostype, instanceType, runTime):
+    """
+    Get Cost in USD to run a ECS task where launchMode==EC2.
+    The AWS Pricing API returns all costs in hours. runTime is in seconds.
+    """
+    global pricing_dict
+    global region_table
+
+    pricing_key = '_'.join(['ec2',region, instanceType, ostype]) 
+    if pricing_key not in pricing_dict:
+        # Workaround for DUBLIN, Shared Tenancy and Linux
+        (ec2_cpu, ec2_mem, ec2_cost) = ec2_pricing(region_table[region], instanceType, 'Shared', 'Linux')
+        pricing_dict[pricing_key]={}
+        pricing_dict[pricing_key]['cpu'] = ec2_cpu      # Number of CPUs on the EC2 instance
+        pricing_dict[pricing_key]['memory'] = ec2_mem   # GiB of memory on the EC2 instance
+        pricing_dict[pricing_key]['cost'] = ec2_cost    # Cost of EC2 instance (On-demand)
+
+    # Split EC2 cost bewtween memory and weights
+    ec2_cpu2mem = ec2_cpu2mem_weights(pricing_dict[pricing_key]['memory'], pricing_dict[pricing_key]['cpu'])
+    cpu_charges = ( (float(cpu)) / 1024.0 / pricing_dict[pricing_key]['cpu']) * ( float(pricing_dict[pricing_key]['cost']) * ec2_cpu2mem ) * (runTime/60.0/60.0)
+    mem_charges = ( (float(memory)) / 1024.0 / pricing_dict[pricing_key]['memory'] ) * ( float(pricing_dict[pricing_key]['cost']) * (1.0 - ec2_cpu2mem) ) * (runTime/60.0/60.0)
+
+    logging.debug('In cost_of_ec2task: mem_charges=%f, cpu_charges=%f',  mem_charges, cpu_charges)
+    return(mem_charges, cpu_charges)
+
+def cost_of_fgtask(region, cpu, memory, ostype, runTime):
+    global pricing_dict
+    global region_table
+
+    pricing_key = 'fargate_' + region
+    if pricing_key not in pricing_dict:
+        # First time. Updating Dictionary
+        # Workarond - for DUBLIN (cpu_cost, mem_cost) = ecs_pricing(region)
+        (cpu_cost, mem_cost) = ecs_pricing(region_table[region])
+        pricing_dict[pricing_key]={}
+        pricing_dict[pricing_key]['cpu'] = cpu_cost
+        pricing_dict[pricing_key]['memory'] = mem_cost
+
+    mem_charges = ( (float(memory)) / 1024.0 ) * float(pricing_dict[pricing_key]['memory']) * (runTime/60.0/60.0)
+    cpu_charges = ( (float(cpu)) / 1024.0 )    * float(pricing_dict[pricing_key]['cpu'])    * (runTime/60.0/60.0)
+
+    logging.debug('In cost_of_fgtask: mem_charges=%f, cpu_charges=%f',  mem_charges, cpu_charges)
+    return(mem_charges, cpu_charges)
+
+def cost_of_service(tasks, start_m_epoch, end_m_epoch, now):
+    fargate_service_cpu_cost = 0.0
+    fargate_service_mem_cost = 0.0
+    ec2_service_cpu_cost = 0.0
+    ec2_service_mem_cost = 0.0
+
+    if 'Items' in tasks:
+        for task in tasks['Items']:
+            runTime = duration(task['startedAt'], task['stoppedAt'], 0.0, 0.0, float(task['runTime']), now)
+
+            logging.debug("In cost_of_service: runTime = %f seconds", runTime)
+            if task['launchType'] == 'FARGATE':
+                fargate_mem_charges,fargate_cpu_charges = cost_of_fgtask(task['region'], task['cpu'], task['memory'], task['osType'], runTime)
+                fargate_service_mem_cost += fargate_mem_charges
+                fargate_service_cpu_cost += fargate_cpu_charges
+            else:
+                # EC2 Task
+                ec2_mem_charges, ec2_cpu_charges = cost_of_ec2task(task['region'], task['cpu'], task['memory'], task['osType'], task['instanceType'], runTime)
+                ec2_service_mem_cost += ec2_mem_charges
+                ec2_service_cpu_cost += ec2_cpu_charges
+
+    return(fargate_service_cpu_cost, fargate_service_mem_cost, ec2_service_mem_cost, ec2_service_cpu_cost)
+
+if __name__ == "__main__":
+
+    parser = ArgumentParser()
+    parser.add_argument('--region',  '-r', required=True, help="AWS Region in which Amazon ECS service is running.")
+    parser.add_argument('--cluster', '-c', required=True, help="ClusterARN in which Amazon ECS service is running.")
+    parser.add_argument('--service', '-s', required=True, help="Name of the AWS ECS service for which cost has to be calculated.")
+    parser.add_argument('--weight',  '-w', default=0.5, required=False, help="Floating point value that defines CPU:Memory Cost Ratio to be used for dividing EC2 pricing")
+    parser.add_argument("-v", "--verbose", action="store_true")
+
+    period = parser.add_mutually_exclusive_group(required=False)
+    period.add_argument('--month', '-M', help='Show charges for a service for a particular month')
+    period.add_argument('--days',  '-D', help='Show charges for a service for last N days')
+    period.add_argument('--hours',  '-H', help='Show charges for a service for last N hours')
+
+    cli_args = parser.parse_args()
+    region = cli_args.region
+    service = cli_args.service
+
+    # Load region table. We need this to get a mapping of region_name (for e.g. eu-west-1) to
+    # the region_friendly_name (for e.g. 'EU (Ireland)'). Currently, there is no programmatic way
+    # of doing this. We need this to use the AWS Pricing APIs.
+    try:
+        with open('region_table.json') as f:
+            region_table = json.load(f)
+            if region not in region_table.keys():
+                raise
+    except:
+        print("Unexpected error: Unable to read region_table.json or region (%s) not found" % (region))
+        sys.exit(1)
+
+    cpu2mem_weight = float(cli_args.weight)
+
+    if cli_args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+
+    clustername = cli_args.cluster
+    cluster = ecs_getClusterArn(region, clustername)
+    if not cluster:
+        logging.error("Cluster : %s Missing", clustername)
+        sys.exit(1)
+
+    now = datetime.datetime.now()
+
+    dynamodb = boto3.resource("dynamodb", region_name=region)
+    table = dynamodb.Table("ECSTaskStatus")
+
+    tasks = get(table, region, cluster, service)
+    (fg_cpu, fg_mem, ec2_mem, ec2_cpu) = cost_of_service(tasks, 0, 0, now)
+
+    logging.debug("Main: fg_cpu=%f, fg_mem=%f, ec2_mem=%f, ec2_cpu=%f", fg_cpu, fg_mem, ec2_mem, ec2_cpu)
+
+    print("#####################################################################")
+    print("#")
+    print("# ECS Region  : %s, ECS Service Name: %s") % (region, service)
+    print("# ECS Cluster : %s") % (cluster)
+    print("#")
+    print("#")
+    print("# EC2 Usage Cost                    : %s USD") % (ec2_mem+ec2_cpu)
+    print("#         EC2 vCPU Usage Cost       : %s USD") % (ec2_cpu)
+    print("#         EC2 Memory Usage Cost     : %s USD") % (ec2_mem)
+    print("# AWS ECS Fargate vCPU Usage Cost   : %s USD") % (fg_cpu)
+    print("# AWS ECS Fargate Memory Usage Cost : %s USD") % (fg_mem)
+    print("#")
+    print("#####################################################################")
+
+    sys.exit(0)
