@@ -11,6 +11,10 @@
 # This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations under the License.
 
+#
+# NOTE: This code witll work with Python3 only. Some of the code is not compatible
+#       to run on Python2.7.
+
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
 import ast
@@ -81,9 +85,10 @@ def ec2_pricing(region, instance_type, tenancy, ostype):
             ret_dict['instanceType'] = mydict['product']['attributes']['instanceType']
             ret_dict['operatingSystem'] = mydict['product']['attributes']['operatingSystem']
             ret_dict['normalizationSizeFactor'] = mydict['product']['attributes']['normalizationSizeFactor']
-            mydict_terms = mydict['terms']['OnDemand'][mydict['terms']['OnDemand'].keys()[0]]
-            ret_dict['unit'] = mydict_terms['priceDimensions'][mydict_terms['priceDimensions'].keys()[0]]['unit']
-            ret_dict['pricePerUnit'] = mydict_terms['priceDimensions'][mydict_terms['priceDimensions'].keys()[0]]['pricePerUnit']
+
+            mydict_terms = mydict['terms']['OnDemand'][ list( mydict['terms']['OnDemand'].keys() )[0]]
+            ret_dict['unit'] = mydict_terms['priceDimensions'][list( mydict_terms['priceDimensions'].keys() )[0]]['unit']
+            ret_dict['pricePerUnit'] = mydict_terms['priceDimensions'][list( mydict_terms['priceDimensions'].keys() )[0]]['pricePerUnit']
             ret_list.append(ret_dict)
     
     ec2_cpu  = float( ret_list[0]['vcpu'] )
@@ -111,8 +116,8 @@ def ecs_pricing(region):
     if 'PriceList' in response:
         for iter in response['PriceList']:
             mydict = ast.literal_eval(iter)
-            mydict_terms = mydict['terms']['OnDemand'][mydict['terms']['OnDemand'].keys()[0]]
-            mydict_price_dim = mydict_terms['priceDimensions'][mydict_terms['priceDimensions'].keys()[0]]
+            mydict_terms = mydict['terms']['OnDemand'][list( mydict['terms']['OnDemand'].keys() )[0]]
+            mydict_price_dim = mydict_terms['priceDimensions'][list( mydict_terms['priceDimensions'].keys() )[0]]
             if mydict_price_dim['description'].find('CPU') > -1:
                 cpu_cost = mydict_price_dim['pricePerUnit']['USD']
             if mydict_price_dim['description'].find('Memory') > -1:
@@ -244,7 +249,7 @@ if __name__ == "__main__":
     # the region_friendly_name (for e.g. 'EU (Ireland)'). Currently, there is no programmatic way
     # of doing this. We need this to use the AWS Pricing APIs.
     try:
-        with open('region_table.json') as f:
+        with open('region_table.json', encoding='utf-8') as f:
             region_table = json.load(f)
             if region not in region_table.keys():
                 raise
@@ -275,15 +280,15 @@ if __name__ == "__main__":
 
     print("#####################################################################")
     print("#")
-    print("# ECS Region  : %s, ECS Service Name: %s") % (region, service)
-    print("# ECS Cluster : %s") % (cluster)
+    print("# ECS Region  : %s, ECS Service Name: %s" % (region, service) )
+    print("# ECS Cluster : %s" % (cluster))
     print("#")
     print("#")
-    print("# EC2 Usage Cost                    : %s USD") % (ec2_mem+ec2_cpu)
-    print("#         EC2 vCPU Usage Cost       : %s USD") % (ec2_cpu)
-    print("#         EC2 Memory Usage Cost     : %s USD") % (ec2_mem)
-    print("# AWS ECS Fargate vCPU Usage Cost   : %s USD") % (fg_cpu)
-    print("# AWS ECS Fargate Memory Usage Cost : %s USD") % (fg_mem)
+    print("# EC2 Usage Cost                    : %.6f USD" % (ec2_mem+ec2_cpu) )
+    print("#         EC2 vCPU Usage Cost       : %.6f USD" % (ec2_cpu) )
+    print("#         EC2 Memory Usage Cost     : %.6f USD" % (ec2_mem) )
+    print("# AWS ECS Fargate vCPU Usage Cost   : %.6f USD" % (fg_cpu) )
+    print("# AWS ECS Fargate Memory Usage Cost : %.6f USD" % (fg_mem) )
     print("#")
     print("#####################################################################")
 
