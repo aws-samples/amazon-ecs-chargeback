@@ -20,6 +20,8 @@ from boto3.dynamodb.conditions import Key, Attr
 import ast
 from argparse import ArgumentParser
 import datetime
+from dateutil.tz import *
+from dateutil.relativedelta import *
 import re
 import sys
 import logging
@@ -125,34 +127,91 @@ def ecs_pricing(region):
 
     return(cpu_cost, mem_cost)
 
-def duration(startedAt, stoppedAt, start_m_epoch, stop_m_epoch, runTime, now):
+def get_datetime_start_end(now, month, days, hours):
+
+    logging.debug('In get_datetime_start_end(). month = %s, days = %s, hours = %s', month, days, hours)
+    meter_end = now
+
+    if month:
+        # Will accept MM/YY and MM/YYYY format as input.
+        regex = r"(?<![/\d])(?:0\d|[1][012])/(?:19|20)?\d{2}(?![/\d])"
+        r = re.match(regex, month)
+        if not r:
+            print("Month provided doesn't look valid: %s" % (month))
+            sys.exit(1)
+        [m,y] = r.group().split('/')
+        iy = 2000 + int(y) if int(y) <= 99 else int(y)
+        im = int(m)
+
+        meter_start = datetime.datetime(iy, im, 1, 0, 0, 0, 0, tzinfo=tzutc())
+        meter_end = meter_start + relativedelta(months=1)
+
+    if days:
+        # Last N days = datetime(now) - timedelta (days = N)
+        # Last N days could also be last N compelted days.
+        # We use the former approach.
+        if not days.isdigit():
+            print("Duration provided is not a integer: %s" % (days))
+            sys.exit(1)
+        meter_start = meter_end - datetime.timedelta(days = int(days))
+    if hours:
+        if not hours.isdigit():
+            print("Duration provided is not a integer" % (hours))
+            sys.exit(1)
+        meter_start = meter_end - datetime.timedelta(hours = int(hours))
+
+    return (meter_start, meter_end)
+
+def duration(startedAt, stoppedAt, startMeter, stopMeter, runTime, now):
     """
     Get the duration for which the task's cost needs to be calculated.
     This will vary depending on the CLI's input parameter (task lifetime,
     particular month, last N days etc.) and how long the task has run.
-    TODO: Currently, we are only considering the task lifetime. The CLI
-    input parameter needs to be worked on.
     """
-
     mRunTime = 0.0
+    task_start = datetime.datetime.strptime(startedAt, '%Y-%m-%dT%H:%M:%S.%fZ')
+    task_start = task_start.replace(tzinfo=datetime.timezone.utc)
 
-    start_e = datetime.datetime.strptime(startedAt, '%Y-%m-%dT%H:%M:%S.%fZ')
     if (stoppedAt == 'STILL-RUNNING'):
-        stopped_e = now
-        mRunTime = round ( (stopped_e-start_e).total_seconds() )
+        task_stop = now
     else:
-        #stopped_e = datetime.datetime.strptime(stoppedAt, '%Y-%m-%dT%H:%M:%S.%fZ')
-        mRunTime = runTime
+        task_stop = datetime.datetime.strptime(stoppedAt, '%Y-%m-%dT%H:%M:%S.%fZ')
+        task_stop = task_stop.replace(tzinfo=datetime.timezone.utc)
 
+    # Return the complete task lifetime in seconds if metering duration is not provided at input.
+    if not startMeter or not stopMeter:
+        mRunTime = round ( (task_stop - task_start).total_seconds() )
+        logging.debug('In duration (task lifetime): mRunTime=%f',  mRunTime)
+        return(mRunTime)
+
+    # Task runtime:              |------------|
+    # Metering duration: |----|     or            |----|
+    if (task_start >= stopMeter) or (task_stop <= startMeter): 
+        mRunTime = 0.0
+        logging.debug('In duration (meter duration different OOB): mRunTime=%f',  mRunTime)
+        return(mRunTime)
+
+    # Remaining scenarios:
+    #
+    # Task runtime:                |-------------|
+    # Metering duration:   |----------|  or   |------|
+    # Calculated duration:         |--|  or   |--|
+    #
+    # Task runtime:                |-------------|
+    # Metering duration:              |-------|
+    # Calculated duration:            |-------|
+    #
+    # Task runtime:                |-------------|
+    # Metering duration:   |-------------------------|
+    # Calculated duration:         |-------------|
+    #
+
+    calc_start = startMeter if (startMeter >= task_start) else task_start
+    calc_stop = task_stop if (stopMeter >= task_stop) else stopMeter
+
+    mRunTime = round ( (calc_stop - calc_start).total_seconds() )
+    logging.debug('In duration(), mRunTime = %f', mRunTime)
     return(mRunTime)
-
-    if runTime == 0.0:
-        # Task is still running.
-        # EndTime should be:
-        #   Now - if I am measuring last N days, last N hours, or complete lifetime.
-        #   Last Day of Month - if I am finding cost for a particular month.
-        # 
-        endTime = stop_m_epoch
 
 def ec2_cpu2mem_weights(mem, cpu):
     # Depending on the type of instance, we can make split cost beteen CPU and memory
@@ -176,6 +235,11 @@ def cost_of_ec2task(region, cpu, memory, ostype, instanceType, runTime):
         pricing_dict[pricing_key]['cpu'] = ec2_cpu      # Number of CPUs on the EC2 instance
         pricing_dict[pricing_key]['memory'] = ec2_mem   # GiB of memory on the EC2 instance
         pricing_dict[pricing_key]['cost'] = ec2_cost    # Cost of EC2 instance (On-demand)
+
+    # Corner case: When no CPU is assigned to a ECS Task, cpushares = 0
+    # Workaround: Assume a minimum cpushare, say 128 or 256 (0.25 vcpu is the minimum on Fargate).
+    if cpu == '0':
+        cpu = '128'
 
     # Split EC2 cost bewtween memory and weights
     ec2_cpu2mem = ec2_cpu2mem_weights(pricing_dict[pricing_key]['memory'], pricing_dict[pricing_key]['cpu'])
@@ -204,7 +268,7 @@ def cost_of_fgtask(region, cpu, memory, ostype, runTime):
     logging.debug('In cost_of_fgtask: mem_charges=%f, cpu_charges=%f',  mem_charges, cpu_charges)
     return(mem_charges, cpu_charges)
 
-def cost_of_service(tasks, start_m_epoch, end_m_epoch, now):
+def cost_of_service(tasks, meter_start, meter_end, now):
     fargate_service_cpu_cost = 0.0
     fargate_service_mem_cost = 0.0
     ec2_service_cpu_cost = 0.0
@@ -212,7 +276,7 @@ def cost_of_service(tasks, start_m_epoch, end_m_epoch, now):
 
     if 'Items' in tasks:
         for task in tasks['Items']:
-            runTime = duration(task['startedAt'], task['stoppedAt'], 0.0, 0.0, float(task['runTime']), now)
+            runTime = duration(task['startedAt'], task['stoppedAt'], meter_start, meter_end, float(task['runTime']), now)
 
             logging.debug("In cost_of_service: runTime = %f seconds", runTime)
             if task['launchType'] == 'FARGATE':
@@ -245,6 +309,8 @@ if __name__ == "__main__":
     region = cli_args.region
     service = cli_args.service
 
+    metered_results = True if (cli_args.month or cli_args.days or cli_args.hours) else False
+
     # Load region table. We need this to get a mapping of region_name (for e.g. eu-west-1) to
     # the region_friendly_name (for e.g. 'EU (Ireland)'). Currently, there is no programmatic way
     # of doing this. We need this to use the AWS Pricing APIs.
@@ -268,13 +334,19 @@ if __name__ == "__main__":
         logging.error("Cluster : %s Missing", clustername)
         sys.exit(1)
 
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(tz=tzutc())
 
     dynamodb = boto3.resource("dynamodb", region_name=region)
     table = dynamodb.Table("ECSTaskStatus")
 
     tasks = get(table, region, cluster, service)
-    (fg_cpu, fg_mem, ec2_mem, ec2_cpu) = cost_of_service(tasks, 0, 0, now)
+
+    if metered_results:
+        (meter_start, meter_end) = get_datetime_start_end(now, cli_args.month, cli_args.days, cli_args.hours)
+        (fg_cpu, fg_mem, ec2_mem, ec2_cpu) = cost_of_service(tasks, meter_start, meter_end, now)
+    else: 
+        (fg_cpu, fg_mem, ec2_mem, ec2_cpu) = cost_of_service(tasks, 0, 0, now)
+
 
     logging.debug("Main: fg_cpu=%f, fg_mem=%f, ec2_mem=%f, ec2_cpu=%f", fg_cpu, fg_mem, ec2_mem, ec2_cpu)
 
@@ -283,13 +355,31 @@ if __name__ == "__main__":
     print("# ECS Region  : %s, ECS Service Name: %s" % (region, service) )
     print("# ECS Cluster : %s" % (cluster))
     print("#")
+
+    if metered_results:
+        if cli_args.month:
+            print("# Cost calculated for month %s" % (cli_args.month) )
+        else:
+            print("# Cost calculated for last %s %s" % (cli_args.days if cli_args.days else cli_args.hours, "days" if cli_args.days else "hours") )
+
     print("#")
-    print("# EC2 Usage Cost                    : %.6f USD" % (ec2_mem+ec2_cpu) )
-    print("#         EC2 vCPU Usage Cost       : %.6f USD" % (ec2_cpu) )
-    print("#         EC2 Memory Usage Cost     : %.6f USD" % (ec2_mem) )
-    print("# AWS ECS Fargate vCPU Usage Cost   : %.6f USD" % (fg_cpu) )
-    print("# AWS ECS Fargate Memory Usage Cost : %.6f USD" % (fg_mem) )
-    print("#")
+
+    if ec2_mem or ec2_cpu:
+        print("# Amazon ECS Service Cost           : %.6f USD" % (ec2_mem+ec2_cpu) )
+        print("#         (Launch Type : EC2)")
+        print("#         EC2 vCPU Usage Cost       : %.6f USD" % (ec2_cpu) )
+        print("#         EC2 Memory Usage Cost     : %.6f USD" % (ec2_mem) )
+    if fg_cpu or fg_mem:
+        print("# Amazon ECS Service Cost           : %.6f USD" % (fg_mem+fg_cpu) )
+        print("#         (Launch Type : FARGATE)")
+        print("#         Fargate vCPU Usage Cost   : %.6f USD" % (fg_cpu) )
+        print("#         Fargate Memory Usage Cost : %.6f USD" % (fg_mem) )
+        print("#")
+
+    if not (fg_cpu or fg_mem or ec2_mem or ec2_cpu):
+        print("# Service Cost: 0 USD. Service not running in specified duration!")
+        print("#")
+
     print("#####################################################################")
 
     sys.exit(0)
